@@ -21,6 +21,7 @@
 #define EGL_EGLEXT_PROTOTYPES
 /* For RTLD_DEFAULT */
 #define _GNU_SOURCE
+#include <unistd.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <fcntl.h>
@@ -29,7 +30,7 @@
 #include <linux/ioctl.h>
 #include <sys/mman.h>
 #include <sys/time.h>
-#include <syscall.h>
+#include <sys/syscall.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
@@ -39,6 +40,7 @@
 #include <stdlib.h>
 #include <malloc.h>
 #include <string.h>
+#include <linux/fb.h>
 
 static void *_libmali = NULL;
 
@@ -49,6 +51,9 @@ static EGLBoolean  (*_eglInitialize)(EGLDisplay dpy, EGLint *major, EGLint *mino
 static EGLBoolean  (*_eglTerminate)(EGLDisplay dpy) = NULL;
 
 static const char *  (*_eglQueryString)(EGLDisplay dpy, EGLint name) = NULL;
+static void (*_glGetIntegerv)(GLenum pname, GLint *params) = NULL;
+void (*_glViewport)(GLint x, GLint y, GLsizei width, GLsizei height) = NULL;
+void (*_glMatrixMode)(GLenum mode) = NULL;
 
 static EGLBoolean  (*_eglGetConfigs)(EGLDisplay dpy, EGLConfig *configs,
 		EGLint config_size, EGLint *num_config) = NULL;
@@ -117,6 +122,8 @@ static void (*_glEGLImageTargetTexture2DOES) (GLenum target, GLeglImageOES image
 
 static __eglMustCastToProperFunctionPointerType (*_eglGetProcAddress)(const char *procname) = NULL;
 
+static const GLubyte * (*_glGetString)(GLenum name);
+
 static void _init_maliegl()
 {
 	_libmali = (void *) dlopen(getenv("LIBMALI") ? getenv("LIBMALI") : "libMali.so", RTLD_LAZY);
@@ -142,6 +149,27 @@ static void _init_maliegl()
 		}																\
 	} while (0)
 
+const GLubyte* glGetString(GLenum name)
+{
+	EGL_DLSYM(&_glGetString, "glGetString");
+	fprintf(stderr, "====%s(%d)====\n", __func__);
+	return (void *)(*_glGetString)(name);
+}
+
+void glGetIntegerv (GLenum pname, GLint *params)
+{
+	EGL_DLSYM(&_glGetIntegerv, "glGetIntegerv");
+	fprintf(stderr, "====%s====\n", __func__);
+	(*_glGetIntegerv)(pname, params);
+}
+
+void glViewport(GLint x, GLint y, GLsizei width, GLsizei height)
+{
+	EGL_DLSYM(&_glViewport, "glViewport");
+	fprintf(stderr, "====%s====\n", __func__);
+	(*_glViewport)(x, y, width, height);
+}
+
 EGLint eglGetError(void)
 {
 	EGL_DLSYM(&_eglGetError, "eglGetError");
@@ -151,29 +179,32 @@ EGLint eglGetError(void)
 
 EGLDisplay eglGetDisplay(EGLNativeDisplayType display_id)
 {
+	EGLDisplay disp;
 	EGL_DLSYM(&_eglGetDisplay, "eglGetDisplay");
-	fprintf(stderr, "====%s=%p====\n", __func__, *_eglGetDisplay);
-	return (*_eglGetDisplay)(display_id);
+	fprintf(stderr, "====%s=%p=(%d)==\n", __func__, *_eglGetDisplay, display_id);
+	disp = (*_eglGetDisplay)(display_id);
+	fprintf(stderr, "=>%dp\n", disp);
+	return disp;
 }
 
 EGLBoolean eglInitialize(EGLDisplay dpy, EGLint *major, EGLint *minor)
 {
 	EGL_DLSYM(&_eglInitialize, "eglInitialize");
-	fprintf(stderr, "====%s====\n", __func__);
+	fprintf(stderr, "====%s=(%p)===\n", __func__, dpy);
 	return (*_eglInitialize)(dpy, major, minor);
 }
 
 EGLBoolean eglTerminate(EGLDisplay dpy)
 {
 	EGL_DLSYM(&_eglTerminate, "eglTerminate");
-	fprintf(stderr, "====%s====\n", __func__);
+	fprintf(stderr, "====%s=(%p)===\n", __func__, dpy);
 	return (*_eglTerminate)(dpy);
 }
 
 const char * eglQueryString(EGLDisplay dpy, EGLint name)
 {
 	EGL_DLSYM(&_eglQueryString, "eglQueryString");
-	fprintf(stderr, "====%s====\n", __func__);
+	fprintf(stderr, "====%s=(%p, %s)===\n", __func__, dpy, name);
 	return (*_eglQueryString)(dpy, name);
 }
 
@@ -181,7 +212,7 @@ EGLBoolean eglGetConfigs(EGLDisplay dpy, EGLConfig *configs,
 		EGLint config_size, EGLint *num_config)
 {
 	EGL_DLSYM(&_eglGetConfigs, "eglGetConfigs");
-	fprintf(stderr, "====%s====\n", __func__);
+	fprintf(stderr, "====%s=(%p)==\n", __func__, dpy);
 	return (*_eglGetConfigs)(dpy, configs, config_size, num_config);
 }
 
@@ -190,7 +221,7 @@ EGLBoolean eglChooseConfig(EGLDisplay dpy, const EGLint *attrib_list,
 		EGLint *num_config)
 {
 	EGL_DLSYM(&_eglChooseConfig, "eglChooseConfig");
-	fprintf(stderr, "====%s====\n", __func__);
+	fprintf(stderr, "====%s=(%p)===\n", __func__, dpy);
 	return (*_eglChooseConfig)(dpy, attrib_list,
 			configs, config_size,
 			num_config);
@@ -200,7 +231,7 @@ EGLBoolean eglGetConfigAttrib(EGLDisplay dpy, EGLConfig config,
 		EGLint attribute, EGLint *value)
 {
 	EGL_DLSYM(&_eglGetConfigAttrib, "eglGetConfigAttrib");
-	fprintf(stderr, "====%s====\n", __func__);
+	fprintf(stderr, "====%s=(%p)===\n", __func__, dpy);
 	return (*_eglGetConfigAttrib)(dpy, config,
 			attribute, value);
 }
@@ -209,9 +240,12 @@ EGLSurface eglCreateWindowSurface(EGLDisplay dpy, EGLConfig config,
 		EGLNativeWindowType win,
 		const EGLint *attrib_list)
 {
+	EGLSurface srf;
 	EGL_DLSYM(&_eglCreateWindowSurface, "eglCreateWindowSurface");
-	fprintf(stderr, "====%s====\n", __func__);
-	return (*_eglCreateWindowSurface)(dpy, config, win, attrib_list);
+	fprintf(stderr, "====%s=(%p, %p, %p)==\n", __func__, dpy, config, win);
+	srf = (*_eglCreateWindowSurface)(dpy, config, win, attrib_list);
+	fprintf(stderr, "=>%p\n", srf);
+	return srf;
 }
 
 EGLSurface eglCreatePbufferSurface(EGLDisplay dpy, EGLConfig config,
@@ -234,7 +268,7 @@ EGLSurface eglCreatePixmapSurface(EGLDisplay dpy, EGLConfig config,
 EGLBoolean eglDestroySurface(EGLDisplay dpy, EGLSurface surface)
 {
 	EGL_DLSYM(&_eglDestroySurface, "eglDestroySurface");
-	fprintf(stderr, "====%s====\n", __func__);
+	fprintf(stderr, "====%s=(%p, %p)==\n", __func__, dpy, surface);
 	return (*_eglDestroySurface)(dpy, surface);
 }
 
@@ -307,7 +341,7 @@ EGLBoolean eglReleaseTexImage(EGLDisplay dpy, EGLSurface surface, EGLint buffer)
 
 EGLBoolean eglSwapInterval(EGLDisplay dpy, EGLint interval)
 {
-	EGL_DLSYM(&_eglGetCurrentSurface, "eglGetCurrentSurface");
+	EGL_DLSYM(&_eglSwapInterval, "eglSwapInterval");
 	fprintf(stderr, "====%s====\n", __func__);
 	return (*_eglSwapInterval)(dpy, interval);
 }
@@ -382,7 +416,7 @@ EGLBoolean eglWaitNative(EGLint engine)
 EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface)
 {
 	EGL_DLSYM(&_eglSwapBuffers, "eglSwapBuffers");
-	fprintf(stderr, "====%s====\n", __func__);
+	fprintf(stderr, "====%s=(%p, %p)===\n", __func__, dpy, surface);
 	return (*_eglSwapBuffers)(dpy, surface);
 }
 
@@ -396,9 +430,19 @@ EGLBoolean eglCopyBuffers(EGLDisplay dpy, EGLSurface surface,
 
 __eglMustCastToProperFunctionPointerType eglGetProcAddress(const char *procname)
 {
-	EGL_DLSYM(&_eglGetProcAddress, "eglGetProcAddress");
-	fprintf(stderr, "====%s====\n", __func__);
-	return (*_eglGetProcAddress)(procname);
+	__eglMustCastToProperFunctionPointerType ret = NULL;
+	
+	_init_maliegl();											\
+
+	ret = (void *) dlsym(_libmali, procname);					\
+	if (!ret) {												\
+		fprintf(stderr, "failed to find symbol %s\n", procname);		\
+		EGL_DLSYM(&_eglGetProcAddress, "eglGetProcAddress");
+		fprintf(stderr, "====%s====\n", __func__);
+		return (*_eglGetProcAddress)(procname);
+	}
+	else
+		return ret;
 }
 
 EGLBoolean eglDestroyImageKHR(EGLDisplay dpy, EGLImageKHR image)
@@ -428,8 +472,13 @@ EGLBoolean eglDestroyImageKHR(EGLDisplay dpy, EGLImageKHR image)
 #undef SYS_MMAP
 #undef SYS_MUNMAP
 
+#ifdef SYS_openat
+#define SYS_OPEN(file, oflag, mode) \
+	syscall(SYS_openat, AT_FDCWD, (const char *)(file), (int)(oflag), (mode_t)(mode))
+#else
 #define SYS_OPEN(file, oflag, mode) \
 	syscall(SYS_open, (const char *)(file), (int)(oflag), (mode_t)(mode))
+#endif
 #define SYS_CLOSE(fd) \
 	syscall(SYS_close, (int)(fd))
 #define SYS_DUP(fd) \
@@ -441,7 +490,7 @@ EGLBoolean eglDestroyImageKHR(EGLDisplay dpy, EGLImageKHR image)
 #define SYS_WRITE(fd, buf, len) \
 	syscall(SYS_write, (int)(fd), (const void *)(buf), (size_t)(len));
 #define SYS_MMAP(addr, len, prot, flags, fd, off) \
-	syscall(SYS_mmap2, (void *)(addr), (size_t)(len), \
+	syscall(SYS_mmap2, (long)(addr), (size_t)(len), \
 			(int)(prot), (int)(flags), (int)(fd), (__off_t)((off) >> MMAP2_PAGE_SHIFT))
 #define SYS_MUNMAP(addr, len) \
 	syscall(SYS_munmap, (void *)(addr), (size_t)(len))
@@ -453,11 +502,11 @@ EGLBoolean eglDestroyImageKHR(EGLDisplay dpy, EGLImageKHR image)
 
 #define WRAP_PUBLIC __attribute__ ((visibility("default")))
 
+static fbdev_fd = -1;
+
 WRAP_PUBLIC int open(const char *file, int oflag, ...)
 {
 	int fd;
-
-	fprintf(stderr, "====%s=%s===\n", __func__, file);
 
 	if (oflag & O_CREAT) {
 		va_list ap;
@@ -472,6 +521,11 @@ WRAP_PUBLIC int open(const char *file, int oflag, ...)
 	} else
 		fd = SYS_OPEN(file, oflag, 0);
 
+	fprintf(stderr, "====%s=%s=%d===\n", __func__, file, fd);
+
+	if (!strcmp(file, "/dev/fb0"))
+		fbdev_fd = fd;
+
 	return fd;
 }
 
@@ -480,7 +534,6 @@ WRAP_PUBLIC int open64(const char *file, int oflag, ...)
 {
 	int fd;
 
-	fprintf(stderr, "====%s====\n", __func__);
 	if (oflag & O_CREAT) {
 		va_list ap;
 		mode_t mode;
@@ -494,59 +547,149 @@ WRAP_PUBLIC int open64(const char *file, int oflag, ...)
 	} else
 		fd = SYS_OPEN(file, oflag | O_LARGEFILE, 0);
 
+	fprintf(stderr, "====%s=%s=%d===\n", __func__, file, fd);
+
 	return fd;
 }
 #endif
 
 WRAP_PUBLIC int close(int fd)
 {
-	fprintf(stderr, "====%s====\n", __func__);
+	fprintf(stderr, "====%s=%d===\n", __func__, fd);
+	if (fd == fbdev_fd)
+		fbdev_fd = -1;
 	return SYS_CLOSE(fd);
 }
 
 WRAP_PUBLIC int dup(int fd)
 {
-	fprintf(stderr, "====%s====\n", __func__);
+	if (fd == fbdev_fd)
+		fprintf(stderr, "====%s=%d===\n", __func__, fd);
 	return SYS_DUP(fd);
+}
+
+static void print_var_screeninfo(void *p)
+{
+	struct fb_var_screeninfo *info = p;
+
+	fprintf(stderr, " - xres = %d\n", info->xres);
+	fprintf(stderr, " - yres = %d\n", info->yres);
+	fprintf(stderr, " - xres_virtual = %d\n", info->xres_virtual);
+	fprintf(stderr, " - yres_virtual = %d\n", info->yres_virtual);
+	fprintf(stderr, " - xoffset = %d\n", info->xoffset);
+	fprintf(stderr, " - yoffset = %d\n", info->yoffset);
+	fprintf(stderr, " - bits_per_pixel = %d\n", info->bits_per_pixel);
+	fprintf(stderr, " - grayscale = %d\n", info->grayscale);
+	fprintf(stderr, " - red.length = %d\n", info->red.length);
+	fprintf(stderr, " - green.length = %d\n", info->green.length);
+	fprintf(stderr, " - blue.length = %d\n", info->blue.length);
+	fprintf(stderr, " - transp.length = %d\n", info->transp.length);
+	fprintf(stderr, " - nostd = %d\n", info->nonstd);
+}
+
+static void print_fix_screeninfo(void *p)
+{
+	struct fb_fix_screeninfo *info = p;
+
+	fprintf(stderr, " - id = %s\n", info->id);
+	fprintf(stderr, " - smem_start = %x\n", info->smem_start);
+	fprintf(stderr, " - smem_len = %d\n", info->smem_len);
+	fprintf(stderr, " - type = %d\n", info->type);
+	fprintf(stderr, " - type_aux = %d\n", info->type_aux);
+	fprintf(stderr, " - visual = %d\n", info->visual);
+	fprintf(stderr, " - xpanstep = %d\n", info->xpanstep);
+	fprintf(stderr, " - ypanstep = %d\n", info->ypanstep);
+	fprintf(stderr, " - ywrapstep = %d\n", info->ywrapstep);
+	fprintf(stderr, " - line_length = %d\n", info->line_length);
+	fprintf(stderr, " - mmio_start = %x\n", info->mmio_start);
+	fprintf(stderr, " - mmio_len = %d\n", info->mmio_len);
+	fprintf(stderr, " - accel = %d\n", info->accel);
+	fprintf(stderr, " - capabilities = %d\n", info->capabilities);
 }
 
 WRAP_PUBLIC int ioctl(int fd, unsigned long int request, ...)
 {
+	int ret;
 	void *arg;
 	va_list ap;
-	fprintf(stderr, "====%s====\n", __func__);
 
 	va_start(ap, request);
 	arg = va_arg(ap, void *);
 	va_end(ap);
 
-	return SYS_IOCTL(fd, request, arg);
+	if (fd == fbdev_fd) {
+		fprintf(stderr, "====%s=%d=%x==(%d)\n", __func__, fd, request, getpid());
+		
+		switch(request) {
+		case FBIOPUT_VSCREENINFO:
+			fprintf(stderr, "==> FBIOPUT_VSCREENINFO\n");
+			print_var_screeninfo(arg); 
+			break;
+		case FBIOPAN_DISPLAY:
+			fprintf(stderr, "==> FBIOPAN_DISPLAY\n");
+			print_var_screeninfo(arg); 
+			break;
+		case FBIO_WAITFORVSYNC:
+			fprintf(stderr, "==> FBIO_WAITFORVSYNC\n");
+			break;
+		case FBIOGET_VSCREENINFO:
+		case FBIOGET_FSCREENINFO:
+			break;
+		default:
+			return 0;
+		}
+		
+	}
+
+	ret = SYS_IOCTL(fd, request, arg);
+
+	if (fd == fbdev_fd) {
+		switch(request) {
+		case FBIOGET_VSCREENINFO:
+			fprintf(stderr, "==> FBIOGET_VSCREENINFO\n");
+			print_var_screeninfo(arg); 
+			break;
+		case FBIOGET_FSCREENINFO:
+			fprintf(stderr, "==> FBIOGET_FSCREENINFO\n");
+			print_fix_screeninfo(arg);
+			break;
+		}
+	}
+
+	return ret;
 }
 
 WRAP_PUBLIC ssize_t read(int fd, void *buffer, size_t n)
 {
-	fprintf(stderr, "====%s====\n", __func__);
+	if (fd == fbdev_fd)
+		fprintf(stderr, "====%s=%d===\n", __func__, fd);
 	return SYS_READ(fd, buffer, n);
 }
 
 WRAP_PUBLIC void *mmap(void *start, size_t length, int prot, int flags, int fd,
 		__off_t offset)
 {
-	fprintf(stderr, "====%s====\n", __func__);
-	return (void *)SYS_MMAP(start, length, prot, flags, fd, offset);
+	void *ret;	
+	if (fd == fbdev_fd)
+		fprintf(stderr, "====%s(%p, %lu, %d, %d, %d, %lu)==\n", __func__, start, length, prot, flags, fd, offset);
+	ret = (void *)SYS_MMAP(start, length, prot, flags, fd, offset);
+	if (fd == fbdev_fd)
+		fprintf(stderr, "====%s=%p=====\n", __func__, ret);
+	return ret;
 }
 
 #ifdef linux
 WRAP_PUBLIC void *mmap64(void *start, size_t length, int prot, int flags, int fd,
 		__off64_t offset)
 {
-	fprintf(stderr, "====%s====\n", __func__);
+	if (fd == fbdev_fd)
+		fprintf(stderr, "====%s=%d=%x==\n", __func__, fd, offset);
 	return (void *)SYS_MMAP(start, length, prot, flags, fd, offset);
 }
 #endif
 
 WRAP_PUBLIC int munmap(void *start, size_t length)
 {
-	fprintf(stderr, "====%s====\n", __func__);
+	fprintf(stderr, "====%s=%p===\n", __func__, start);
 	return SYS_MUNMAP(start, length);
 }
