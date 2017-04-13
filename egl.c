@@ -241,8 +241,9 @@ EGLSurface eglCreateWindowSurface(EGLDisplay dpy, EGLConfig config,
 		const EGLint *attrib_list)
 {
 	EGLSurface srf;
+	struct fbdev_window *native_display = win;
 	EGL_DLSYM(&_eglCreateWindowSurface, "eglCreateWindowSurface");
-	fprintf(stderr, "====%s=(%p, %p, %p)==\n", __func__, dpy, config, win);
+	fprintf(stderr, "====%s=(%p, %d, %d, %d]=\n", __func__, dpy, config, native_display->width, native_display->height);
 	srf = (*_eglCreateWindowSurface)(dpy, config, win, attrib_list);
 	fprintf(stderr, "=>%p\n", srf);
 	return srf;
