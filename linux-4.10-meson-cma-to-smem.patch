@@ -1,0 +1,90 @@
+diff --git a/drivers/gpu/drm/meson/meson_drv.c b/drivers/gpu/drm/meson/meson_drv.c
+index 14aca75..6ed9cd5 100644
+--- a/drivers/gpu/drm/meson/meson_drv.c
++++ b/drivers/gpu/drm/meson/meson_drv.c
+@@ -49,6 +49,8 @@
+ #include "meson_canvas.h"
+ #include "meson_registers.h"
+ 
++#include <uapi/drm/meson_drm.h>
++
+ #define DRIVER_NAME "meson"
+ #define DRIVER_DESC "Amlogic Meson DRM driver"
+ 
+@@ -122,6 +124,32 @@ static irqreturn_t meson_irq(int irq, void *arg)
+ 	.mmap		= drm_gem_cma_mmap,
+ };
+ 
++static int meson_gem_to_smem_ioctl(struct drm_device *drm, void *data,
++				   struct drm_file *file_priv)
++{
++	struct drm_meson_gem_smem *args = data;
++	struct drm_gem_cma_object *objs;
++	struct drm_gem_object *obj;
++
++	obj = drm_gem_object_lookup(file_priv, args->handle);
++	if (!obj) {
++		dev_err(drm->dev, "Failed to lookup GEM object\n");
++		return -ENXIO;
++	}
++
++	objs = to_drm_gem_cma_obj(obj);
++
++	args->smem_start = objs->paddr;
++	args->smem_len = obj->size;
++
++	return 0;
++}
++
++static const struct drm_ioctl_desc meson_drv_ioctls[] = {
++	DRM_IOCTL_DEF_DRV(MESON_GEM_TO_SMEM, meson_gem_to_smem_ioctl,
++			  DRM_UNLOCKED | DRM_AUTH),
++};
++
+ static struct drm_driver meson_driver = {
+ 	.driver_features	= DRIVER_HAVE_IRQ | DRIVER_GEM |
+ 				  DRIVER_MODESET | DRIVER_PRIME |
+@@ -153,6 +181,10 @@ static irqreturn_t meson_irq(int irq, void *arg)
+ 	.gem_free_object_unlocked = drm_gem_cma_free_object,
+ 	.gem_vm_ops		= &drm_gem_cma_vm_ops,
+ 
++	/* Custom ioctls */
++	.ioctls			= meson_drv_ioctls,
++	.num_ioctls		= ARRAY_SIZE(meson_drv_ioctls),
++
+ 	/* Misc */
+ 	.fops			= &fops,
+ 	.name			= DRIVER_NAME,
+diff --git a/include/uapi/drm/meson_drm.h b/include/uapi/drm/meson_drm.h
+new file mode 100644
+index 0000000..5b34607
+--- /dev/null
++++ b/include/uapi/drm/meson_drm.h
+@@ -0,0 +1,27 @@
++/*
++ * Copyright (C) 2016 BayLibre, SAS
++ * Author: Neil Armstrong <narmstrong@baylibre.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of
++ * the License, or (at your option) any later version.
++ */
++
++#ifndef _UAPI_MESON_DRM_H_
++#define _UAPI_MESON_DRM_H_
++
++#include <drm/drm.h>
++
++struct drm_meson_gem_smem {
++	__u32 handle;
++	unsigned long smem_start;
++	unsigned long smem_len;
++};
++
++#define DRM_MESON_GEM_TO_SMEM		0x00
++
++#define DRM_IOCTL_MESON_GEM_TO_SMEM	DRM_IOWR(DRM_COMMAND_BASE + DRM_MESON_GEM_TO_SMEM, \
++						 struct drm_meson_gem_smem)
++
++#endif
