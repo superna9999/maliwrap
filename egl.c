@@ -21,26 +21,318 @@
 #define EGL_EGLEXT_PROTOTYPES
 /* For RTLD_DEFAULT */
 #define _GNU_SOURCE
+#define _XOPEN_SOURCE 600
+#include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <fcntl.h>
+#include <stddef.h>
+#include <malloc.h>
+#include <string.h>
+#include <dlfcn.h>
+#include <signal.h>
 #include <sys/ioctl.h>
+#include <linux/fb.h>
 #include <linux/types.h>
 #include <linux/ioctl.h>
 #include <sys/mman.h>
 #include <sys/time.h>
 #include <sys/syscall.h>
+// GL
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
+// GLES
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
-#include <dlfcn.h>
-#include <stddef.h>
-#include <stdlib.h>
-#include <malloc.h>
-#include <string.h>
-#include <linux/fb.h>
+// DRM
+#include <libdrm/drm_mode.h>
+#include <xf86drm.h>
+#include <xf86drmMode.h>
+
+/****** DRM ********/
+
+static const char *dri_path = "/dev/dri/card0";
+
+enum {
+        DEPTH = 24,
+        BPP = 32,
+};
+
+struct drm_dev_t {
+        uint32_t *buf;
+        uint32_t conn_id, enc_id, crtc_id, fb_id;
+        uint32_t width, height;
+        uint32_t pitch, size, handle;
+        drmModeModeInfo mode;
+        drmModeCrtc *saved_crtc;
+        struct drm_dev_t *next;
+	struct fb_var_screeninfo var;
+	struct fb_fix_screeninfo fix;
+};
+
+static struct drm_dev_t *drm_dev;
+static int drm_fd = -1;
+static int drm_init_done;
+
+void fatal(char *str)
+{
+        fprintf(stderr, "%s\n", str);
+        exit(EXIT_FAILURE);
+}
+
+void error(char *str)
+{
+        perror(str);
+        exit(EXIT_FAILURE);
+}
+
+int eopen(const char *path, int flag)
+{
+        int fd;
+
+        if ((fd = open(path, flag)) < 0) {
+                fprintf(stderr, "cannot open \"%s\"\n", path);
+                error("open");
+        }
+        return fd;
+}
+
+void *emmap(int addr, size_t len, int prot, int flag, int fd, off_t offset)
+{
+        uint32_t *fp;
+
+        if ((fp = (uint32_t *) mmap(0, len, prot, flag, fd, offset)) == MAP_FAILED)
+                error("mmap");
+        return fp;
+}
+
+int drm_open(const char *path)
+{
+        int fd, flags;
+        uint64_t has_dumb;
+
+        fd = eopen(path, O_RDWR);
+
+        /* set FD_CLOEXEC flag */
+        if ((flags = fcntl(fd, F_GETFD)) < 0
+                || fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0)
+                fatal("fcntl FD_CLOEXEC failed");
+
+        /* check capability */
+        if (drmGetCap(fd, DRM_CAP_DUMB_BUFFER, &has_dumb) < 0 || has_dumb == 0)
+                fatal("drmGetCap DRM_CAP_DUMB_BUFFER failed or doesn't have dumb buffer");
+
+        return fd;
+}
+
+struct drm_dev_t *drm_find_dev(int fd)
+{
+        int i;
+        struct drm_dev_t *dev = NULL, *dev_head = NULL;
+        drmModeRes *res;
+        drmModeConnector *conn;
+        drmModeEncoder *enc;
+
+        if ((res = drmModeGetResources(fd)) == NULL)
+                fatal("drmModeGetResources() failed");
+
+        /* find all available connectors */
+        for (i = 0; i < res->count_connectors; i++) {
+                conn = drmModeGetConnector(fd, res->connectors[i]);
+
+                if (conn != NULL && conn->connection == DRM_MODE_CONNECTED
+                    && conn->count_modes > 0
+                    && (enc = drmModeGetEncoder(fd, conn->encoder_id))) {
+                        dev = (struct drm_dev_t *) malloc(sizeof(struct drm_dev_t));
+                        memset(dev, 0, sizeof(struct drm_dev_t));
+
+                        dev->conn_id = conn->connector_id;
+                        dev->enc_id = conn->encoder_id;
+                        dev->next = NULL;
+
+                        memcpy(&dev->mode, &conn->modes[0], sizeof(drmModeModeInfo));
+                        dev->width = conn->modes[0].hdisplay;
+                        dev->height = conn->modes[0].vdisplay;
+
+                        dev->crtc_id = enc->crtc_id;
+                        drmModeFreeEncoder(enc);
+
+                        dev->saved_crtc = NULL;
+
+                        /* create dev list */
+                        dev->next = dev_head;
+                        dev_head = dev;
+                }
+                drmModeFreeConnector(conn);
+        }
+        drmModeFreeResources(res);
+
+        return dev_head;
+}
+
+struct drm_meson_gem_smem {
+        __u32 handle;
+        unsigned long smem_start;
+        unsigned long smem_len;
+};
+
+#define DRM_MESON_GEM_TO_SMEM           0x00
+
+#define DRM_IOCTL_MESON_GEM_TO_SMEM     DRM_IOWR(DRM_COMMAND_BASE + DRM_MESON_GEM_TO_SMEM, \
+                                                 struct drm_meson_gem_smem)
+
+void drm_setup_fb(int fd, struct drm_dev_t *dev)
+{
+        struct drm_mode_create_dumb creq;
+        struct drm_mode_map_dumb mreq;
+        struct drm_meson_gem_smem smem;
+
+        memset(&creq, 0, sizeof(struct drm_mode_create_dumb));
+        creq.width = dev->width;
+        creq.height = dev->height*3;
+        creq.bpp = BPP; // hard conding
+
+        if (drmIoctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) < 0)
+                fatal("drmIoctl DRM_IOCTL_MODE_CREATE_DUMB failed");
+
+        smem.handle = creq.handle;
+        if (drmIoctl(fd, DRM_IOCTL_MESON_GEM_TO_SMEM, &smem) == 0) {
+                printf("DUMB smem_start = %x / %d\n", smem.smem_start, smem.smem_len);
+        }
+
+        dev->pitch = creq.pitch;
+        dev->size = creq.size;
+        dev->handle = creq.handle;
+
+        if (drmModeAddFB(fd, dev->width, dev->height,
+                DEPTH, BPP, dev->pitch, dev->handle, &dev->fb_id))
+                fatal("drmModeAddFB failed");
+
+        memset(&mreq, 0, sizeof(struct drm_mode_map_dumb));
+        mreq.handle = dev->handle;
+
+        if (drmIoctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq))
+                fatal("drmIoctl DRM_IOCTL_MODE_MAP_DUMB failed");
+
+        dev->buf = (uint32_t *) emmap(0, dev->size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, mreq.offset);
+
+        dev->saved_crtc = drmModeGetCrtc(fd, dev->crtc_id); /* must store crtc data */
+        if (drmModeSetCrtc(fd, dev->crtc_id, dev->fb_id, 0, 0, &dev->conn_id, 1, &dev->mode))
+                fatal("drmModeSetCrtc() failed");
+
+	// var
+	dev->var.xres = dev->width;
+	dev->var.yres = dev->height;
+	dev->var.xres_virtual = dev->width;
+	dev->var.yres_virtual = creq.height;
+	dev->var.xoffset = 0;
+	dev->var.yoffset = 0;
+	dev->var.bits_per_pixel = BPP;
+	dev->var.grayscale = 0;
+	dev->var.red.length = 8;
+	dev->var.green.length = 8;
+	dev->var.blue.length = 8;
+	dev->var.transp.length = 0;
+	dev->var.nonstd = 0;
+
+	// fix
+	//dev->fix.id = "MESON_DRM";
+	dev->fix.smem_start = smem.smem_start;
+	dev->fix.smem_len = smem.smem_len;
+	dev->fix.type = 0;
+	dev->fix.type_aux = 0;
+	dev->fix.visual = 2;
+	dev->fix.xpanstep = 1;
+	dev->fix.ypanstep = 1;
+	dev->fix.ywrapstep = 0;
+	dev->fix.line_length = dev->width*4;
+	dev->fix.mmio_start = 0;
+	dev->fix.mmio_len = 0;
+	dev->fix.accel = 0;
+	dev->fix.capabilities = 0;
+}
+
+void drm_pan_fb(int fd, struct drm_dev_t *dev, struct fb_var_screeninfo *info)
+{
+		
+}
+
+void drm_destroy(int fd, struct drm_dev_t *dev_head)
+{
+        struct drm_dev_t *devp, *devp_tmp;
+        struct drm_mode_destroy_dumb dreq;
+
+        for (devp = dev_head; devp != NULL;) {
+                if (devp->saved_crtc)
+                        drmModeSetCrtc(fd, devp->saved_crtc->crtc_id, devp->saved_crtc->buffer_id,
+                                devp->saved_crtc->x, devp->saved_crtc->y, &devp->conn_id, 1, &devp->saved_crtc->mode);
+                drmModeFreeCrtc(devp->saved_crtc);
+
+                munmap(devp->buf, devp->size);
+
+                drmModeRmFB(fd, devp->fb_id);
+
+                memset(&dreq, 0, sizeof(dreq));
+                dreq.handle = devp->handle;
+                drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+
+                devp_tmp = devp;
+                devp = devp->next;
+                free(devp_tmp);
+        }
+
+        close(fd);
+}
+
+void intHandler(int dummy) {
+    drm_destroy(drm_fd, drm_dev);
+}
+
+int drm_init()
+{
+        int i, j;
+        uint8_t color;
+        struct drm_dev_t *dev_head, *dev;
+
+	if (drm_init_done)
+		return 0;
+
+	signal(SIGINT, intHandler);
+
+        /* init */
+        drm_fd = drm_open(dri_path);
+        dev_head = drm_find_dev(drm_fd);
+
+        if (dev_head == NULL) {
+                fprintf(stderr, "available drm_dev not found\n");
+                return -1;
+        }
+
+        printf("available connector(s)\n\n");
+        for (dev = dev_head; dev != NULL; dev = dev->next) {
+                printf("connector id:%d\n", dev->conn_id);
+                printf("\tencoder id:%d crtc id:%d fb id:%d\n", dev->enc_id, dev->crtc_id, dev->fb_id);
+                printf("\twidth:%d height:%d\n", dev->width, dev->height);
+        }
+
+        /* FIXME: use first drm_dev */
+        dev = drm_dev = dev_head;
+        drm_setup_fb(drm_fd, dev);
+
+        /* draw something */
+        for (i = 0; i < dev->height; i++)
+                for (j = 0; j < dev->width; j++) {
+                        color = (double) (i * j) / (dev->height * dev->width) * 0xFF;
+                        *(dev->buf + i * dev->width + j) = (uint32_t) 0xFFFFFF & (0x00 << 16 | color << 8 | color);
+           	}
+
+	drm_init_done = 1;
+
+        return 0;
+}
+
+/****** GL Wrapper ******/
 
 static void *_libmali = NULL;
 
@@ -503,11 +795,21 @@ EGLBoolean eglDestroyImageKHR(EGLDisplay dpy, EGLImageKHR image)
 
 #define WRAP_PUBLIC __attribute__ ((visibility("default")))
 
-static fbdev_fd = -1;
+static fbdev_fd = 3746485;
 
 WRAP_PUBLIC int open(const char *file, int oflag, ...)
 {
 	int fd;
+
+	if (!strcmp(file, "/dev/fb0")) {
+		fd = drm_init();
+		if (fd >= 0)
+			fd = fbdev_fd;
+		
+		fprintf(stderr, "====%s=%s=%d===\n", __func__, file, fd);
+		
+		return fd;
+	}
 
 	if (oflag & O_CREAT) {
 		va_list ap;
@@ -524,9 +826,6 @@ WRAP_PUBLIC int open(const char *file, int oflag, ...)
 
 	fprintf(stderr, "====%s=%s=%d===\n", __func__, file, fd);
 
-	if (!strcmp(file, "/dev/fb0"))
-		fbdev_fd = fd;
-
 	return fd;
 }
 
@@ -534,6 +833,16 @@ WRAP_PUBLIC int open(const char *file, int oflag, ...)
 WRAP_PUBLIC int open64(const char *file, int oflag, ...)
 {
 	int fd;
+
+	if (!strcmp(file, "/dev/fb0")) {
+		fd = drm_init();
+		if (fd >= 0)
+			fd = fbdev_fd;
+		
+		fprintf(stderr, "====%s=%s=%d===\n", __func__, file, fd);
+		
+		return fd;
+	}
 
 	if (oflag & O_CREAT) {
 		va_list ap;
@@ -558,14 +867,16 @@ WRAP_PUBLIC int close(int fd)
 {
 	fprintf(stderr, "====%s=%d===\n", __func__, fd);
 	if (fd == fbdev_fd)
-		fbdev_fd = -1;
+		return 0;
+
 	return SYS_CLOSE(fd);
 }
 
 WRAP_PUBLIC int dup(int fd)
 {
 	if (fd == fbdev_fd)
-		fprintf(stderr, "====%s=%d===\n", __func__, fd);
+		return -1;
+
 	return SYS_DUP(fd);
 }
 
@@ -624,26 +935,32 @@ WRAP_PUBLIC int ioctl(int fd, unsigned long int request, ...)
 		switch(request) {
 		case FBIOPUT_VSCREENINFO:
 			fprintf(stderr, "==> FBIOPUT_VSCREENINFO\n");
-			print_var_screeninfo(arg); 
+			//print_var_screeninfo(arg); 
 			break;
 		case FBIOPAN_DISPLAY:
 			fprintf(stderr, "==> FBIOPAN_DISPLAY\n");
-			print_var_screeninfo(arg); 
+			print_var_screeninfo(arg);
+			drm_pan_fb(drm_fd, drm_dev, arg);
 			break;
 		case FBIO_WAITFORVSYNC:
-			fprintf(stderr, "==> FBIO_WAITFORVSYNC\n");
+			//fprintf(stderr, "==> FBIO_WAITFORVSYNC\n");
 			break;
 		case FBIOGET_VSCREENINFO:
-		case FBIOGET_FSCREENINFO:
+			memcpy(arg, &drm_dev->var, sizeof(struct fb_var_screeninfo));
+			print_var_screeninfo(arg); 
 			break;
-		default:
-			return 0;
+		case FBIOGET_FSCREENINFO:
+			memcpy(arg, &drm_dev->fix, sizeof(struct fb_fix_screeninfo));
+			print_fix_screeninfo(arg);
+			break;
 		}
-		
+
+		return 0;
 	}
 
 	ret = SYS_IOCTL(fd, request, arg);
 
+	/*
 	if (fd == fbdev_fd) {
 		switch(request) {
 		case FBIOGET_VSCREENINFO:
@@ -655,7 +972,7 @@ WRAP_PUBLIC int ioctl(int fd, unsigned long int request, ...)
 			print_fix_screeninfo(arg);
 			break;
 		}
-	}
+	}*/
 
 	return ret;
 }
@@ -663,7 +980,7 @@ WRAP_PUBLIC int ioctl(int fd, unsigned long int request, ...)
 WRAP_PUBLIC ssize_t read(int fd, void *buffer, size_t n)
 {
 	if (fd == fbdev_fd)
-		fprintf(stderr, "====%s=%d===\n", __func__, fd);
+		return -1;
 	return SYS_READ(fd, buffer, n);
 }
 
@@ -671,20 +988,23 @@ WRAP_PUBLIC void *mmap(void *start, size_t length, int prot, int flags, int fd,
 		__off_t offset)
 {
 	void *ret;	
-	if (fd == fbdev_fd)
+	if (fd == fbdev_fd) {
 		fprintf(stderr, "====%s(%p, %lu, %d, %d, %d, %lu)==\n", __func__, start, length, prot, flags, fd, offset);
-	ret = (void *)SYS_MMAP(start, length, prot, flags, fd, offset);
-	if (fd == fbdev_fd)
-		fprintf(stderr, "====%s=%p=====\n", __func__, ret);
-	return ret;
+		return drm_dev->buf;
+	}
+
+	return (void *)SYS_MMAP(start, length, prot, flags, fd, offset);
 }
 
 #ifdef linux
 WRAP_PUBLIC void *mmap64(void *start, size_t length, int prot, int flags, int fd,
 		__off64_t offset)
 {
-	if (fd == fbdev_fd)
+	if (fd == fbdev_fd) {
 		fprintf(stderr, "====%s=%d=%x==\n", __func__, fd, offset);
+		return drm_dev->buf;
+	}
+
 	return (void *)SYS_MMAP(start, length, prot, flags, fd, offset);
 }
 #endif
@@ -692,5 +1012,9 @@ WRAP_PUBLIC void *mmap64(void *start, size_t length, int prot, int flags, int fd
 WRAP_PUBLIC int munmap(void *start, size_t length)
 {
 	fprintf(stderr, "====%s=%p===\n", __func__, start);
+
+	if (start == drm_dev->buf)
+		return 0;
+
 	return SYS_MUNMAP(start, length);
 }
